@@ -20,7 +20,7 @@ jobs:
 
       - name: 'Build Inventory Image'
         run: |
-          docker build . --tag ghcr.io/MrMohebi/froward-proxy:${{ github.ref_name }}
-          docker push ghcr.io/MrMohebi/froward-proxy:${{ github.ref_name }}
-          docker tag ghcr.io/MrMohebi/froward-proxy:${{ github.ref_name }} ghcr.io/MrMohebi/froward-proxy:latest
-          docker push ghcr.io/MrMohebi/froward-proxy:latest
+          docker build . --tag ghcr.io/mrmohebi/froward-proxy:${{ github.ref_name }}
+          docker push ghcr.io/mrmohebi/froward-proxy:${{ github.ref_name }}
+          docker tag ghcr.io/mrmohebi/froward-proxy:${{ github.ref_name }} ghcr.io/mrmohebi/froward-proxy:latest
+          docker push ghcr.io/mrmohebi/froward-proxy:latest
