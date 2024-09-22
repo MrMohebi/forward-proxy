@@ -8,6 +8,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o forward-proxy .
 
 
 FROM alpine:3.17
+LABEL org.opencontainers.image.source="https://github.com/MrMohebi/forward-proxy"
 
 WORKDIR /root/app
 
