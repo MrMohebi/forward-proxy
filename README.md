@@ -13,6 +13,9 @@ Usage of /forward_proxy:
         by now 'tcp' is the only supported protocol (default "tcp")
 ```
 
+### image
+`docker pull ghcr.io/mrmohebi/froward-proxy:latest`
+
 ## To-Do:
 - [x] http tcp
 - [x] https tcp
