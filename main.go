@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -22,6 +23,7 @@ var (
 	Port     = flag.String("port", "8080", "port listen to, seperated by ',' like: 80,443,1080 also can be range like 8080-8090, or combination of both ")
 	Protocol = flag.String("protocol", "tcp", "by now 'tcp' is the only supported protocol")
 	Host     = flag.String("host", "0.0.0.0", "host listen to")
+	LogLevel = flag.String("log-level", "info", "logging level: [debug, info, warn, error]")
 	help     = flag.Bool("help", false, "Display help message")
 )
 
@@ -31,6 +33,19 @@ func main() {
 	if *help {
 		flag.Usage()
 		os.Exit(0)
+	}
+
+	switch *LogLevel {
+	case "debug":
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	case "info":
+		slog.SetLogLoggerLevel(slog.LevelInfo)
+	case "warn":
+		slog.SetLogLoggerLevel(slog.LevelWarn)
+	case "error":
+		slog.SetLogLoggerLevel(slog.LevelError)
+	default:
+		log.Fatalf("Invalid log level: %s", *LogLevel)
 	}
 
 	ports := slices.DeleteFunc(strings.Split(*Port, ","), func(e string) bool {
@@ -44,7 +59,8 @@ func main() {
 
 	for _, protocol := range protocols {
 		if !slices.Contains([]string{"tcp"}, protocol) {
-			log.Fatal("defined protocol in not correct, please check your input! (only support tcp)")
+			slog.Error("defined protocol in not correct, please check your input! (only support tcp)")
+			os.Exit(1)
 		}
 
 		for _, port := range ports {
@@ -53,21 +69,23 @@ func main() {
 					return e == ""
 				})
 				if !isNumber(pRange[0]) || !isNumber(pRange[1]) {
-					log.Fatal("defined port in not correct, please check your input!")
+					slog.Error("defined port in not correct, please check your input!")
+					os.Exit(1)
 				}
 				start, _ := strconv.Atoi(pRange[0])
 				end, _ := strconv.Atoi(pRange[1])
 
 				for i := start; i <= end; i++ {
 					wg.Add(1)
-					go listenOn(protocol, *Host+":"+strconv.Itoa(i))
+					go listenOn(protocol, *Host, strconv.Itoa(i))
 				}
 			} else {
 				if !isNumber(port) {
-					log.Fatal("defined port in not correct, please check your input!")
+					slog.Error("defined port in not correct, please check your input!")
+					os.Exit(1)
 				}
 				wg.Add(1)
-				go listenOn(protocol, *Host+":"+port)
+				go listenOn(protocol, *Host, port)
 			}
 
 		}
@@ -76,22 +94,24 @@ func main() {
 	wg.Wait()
 }
 
-func listenOn(protocol string, address string) {
+func listenOn(protocol string, host string, port string) {
+	address := host + ":" + port
 	ln, err := net.Listen(protocol, address)
 	if err != nil {
-		fmt.Println("Error listening:", err)
+		slog.Error("Error listening", "Details", err)
 		return
 	}
 	defer ln.Close()
 
-	fmt.Println("listening on:", protocol+"://"+address)
+	slog.Info("listening on:", "Addr", protocol+"://"+address)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Println("Error accepting connection:", err)
+			slog.Error("Error accepting connection:", "Details", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleConnection(conn, port)
 	}
 }
 
@@ -102,7 +122,7 @@ func isNumber(inp string) bool {
 	return false
 }
 
-func handleConnection(clientConn net.Conn) {
+func handleConnection(clientConn net.Conn, incomingPort string) {
 	defer clientConn.Close()
 
 	var (
@@ -115,48 +135,49 @@ func handleConnection(clientConn net.Conn) {
 		destPort      string
 	)
 
+	destPort = incomingPort
+
 	if err := clientConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		log.Print(err)
+		slog.Error("context timeout", "Details", err)
 		return
 	}
 
 	isHttps, clientReader1, err = isHTTPS(clientConn)
 	if err != nil {
-		println(err)
+		slog.Error("couldn't find it's http or https", "Details", err)
 	}
 
 	if err := clientConn.SetReadDeadline(time.Time{}); err != nil {
-		log.Print(err)
+		slog.Error("context timeout", "Details", err)
 		return
 	}
 
 	if isHttps {
-		println("its https!")
+		slog.Debug("its https!")
 
 		clientHello, clientReader2, err = peekClientHello(clientReader1)
 		if err != nil {
-			log.Print(err)
+			slog.Error("reading clientHello", "Details", err)
 			return
 		}
 		sni = clientHello.ServerName
-		destPort = "443"
+
 	} else {
-		println("its http!")
+		slog.Debug("its http!")
 
 		sni, clientReader2, err = readRequestURLHttp(clientReader1)
 		if err != nil {
-			log.Print(err)
+			slog.Error("reading hostname from http", "Details", err)
 			return
 		}
-		destPort = "80"
+
 	}
 
-	println(sni)
+	slog.Debug("Got new request =>", "From", sni)
 
 	backendConn, err := net.DialTimeout("tcp", net.JoinHostPort(sni, destPort), 5*time.Second)
 	if err != nil {
-		log.Print("err in sending req")
-		log.Print(err)
+		slog.Error("sending req", "Details", err)
 		return
 	}
 	defer backendConn.Close()
