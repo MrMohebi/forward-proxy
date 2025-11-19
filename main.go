@@ -20,7 +20,7 @@ import (
 )
 
 var (
-	Port     = flag.String("port", "8080", "port listen to, seperated by ',' like: 80,443,1080 also can be range like 8080-8090, or combination of both ")
+	Port     = flag.String("port", "9443", "port listen to, seperated by ',' like: 80,443,1080 also can be range like 8080-8090, or combination of both ")
 	Protocol = flag.String("protocol", "tcp", "by now 'tcp' is the only supported protocol")
 	Host     = flag.String("host", "0.0.0.0", "host listen to")
 	LogLevel = flag.String("log-level", "info", "logging level: [debug, info, warn, error]")
@@ -55,11 +55,9 @@ func main() {
 		return e == ""
 	})
 
-	var wg sync.WaitGroup
-
 	for _, protocol := range protocols {
 		if !slices.Contains([]string{"tcp"}, protocol) {
-			slog.Error("defined protocol in not correct, please check your input! (only support tcp)")
+			slog.Error("defined protocol is not correct, please check your input! (only tcp is supported)")
 			os.Exit(1)
 		}
 
@@ -68,58 +66,69 @@ func main() {
 				pRange := slices.DeleteFunc(strings.Split(port, "-"), func(e string) bool {
 					return e == ""
 				})
-				if !isNumber(pRange[0]) || !isNumber(pRange[1]) {
-					slog.Error("defined port in not correct, please check your input!")
+
+				if len(pRange) != 2 {
+					slog.Error("defined port range is not correct, please check your input!", "range", port)
 					os.Exit(1)
 				}
+
+				if !isValidPort(pRange[0]) || !isValidPort(pRange[1]) {
+					slog.Error("defined port range is not correct, please check your input!", "range", port)
+					os.Exit(1)
+				}
+
 				start, _ := strconv.Atoi(pRange[0])
 				end, _ := strconv.Atoi(pRange[1])
 
+				if start > end {
+					slog.Error("defined port range start is greater than end", "start", start, "end", end)
+					os.Exit(1)
+				}
+
 				for i := start; i <= end; i++ {
-					wg.Add(1)
 					go listenOn(protocol, *Host, strconv.Itoa(i))
 				}
 			} else {
-				if !isNumber(port) {
-					slog.Error("defined port in not correct, please check your input!")
+				if !isValidPort(port) {
+					slog.Error("defined port is not correct, please check your input!", "port", port)
 					os.Exit(1)
 				}
-				wg.Add(1)
 				go listenOn(protocol, *Host, port)
 			}
-
 		}
 	}
 
-	wg.Wait()
+	// Block forever while listeners run in goroutines.
+	select {}
+}
+
+func isValidPort(inp string) bool {
+	v, err := strconv.Atoi(inp)
+	if err != nil {
+		return false
+	}
+	return v > 0 && v <= 65535
 }
 
 func listenOn(protocol string, host string, port string) {
 	address := host + ":" + port
 	ln, err := net.Listen(protocol, address)
 	if err != nil {
-		slog.Error("Error listening", "Details", err)
+		slog.Error("Error listening", "addr", protocol+"://"+address, "details", err)
 		return
 	}
 	defer ln.Close()
 
-	slog.Info("listening on:", "Addr", protocol+"://"+address)
+	slog.Info("listening on", "addr", protocol+"://"+address)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			slog.Error("Error accepting connection:", "Details", err)
+			slog.Error("Error accepting connection", "details", err)
 			continue
 		}
 		go handleConnection(conn, port)
 	}
-}
-
-func isNumber(inp string) bool {
-	if _, err := strconv.Atoi(inp); err == nil {
-		return true
-	}
-	return false
 }
 
 func handleConnection(clientConn net.Conn, incomingPort string) {
@@ -135,20 +144,23 @@ func handleConnection(clientConn net.Conn, incomingPort string) {
 		destPort      string
 	)
 
-	destPort = incomingPort
+	destPort = calculateBackendPort(incomingPort)
 
+	// Initial detection timeout
 	if err := clientConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		slog.Error("context timeout", "Details", err)
+		slog.Error("context timeout", "details", err)
 		return
 	}
 
 	isHttps, clientReader1, err = isHTTPS(clientConn)
 	if err != nil {
-		slog.Error("couldn't find it's http or https", "Details", err)
+		slog.Error("couldn't determine if it's http or https", "details", err)
+		return
 	}
 
+	// Clear deadline after detection
 	if err := clientConn.SetReadDeadline(time.Time{}); err != nil {
-		slog.Error("context timeout", "Details", err)
+		slog.Error("clearing read deadline", "details", err)
 		return
 	}
 
@@ -157,27 +169,45 @@ func handleConnection(clientConn net.Conn, incomingPort string) {
 
 		clientHello, clientReader2, err = peekClientHello(clientReader1)
 		if err != nil {
-			slog.Error("reading clientHello", "Details", err)
+			slog.Error("reading clientHello", "details", err)
 			return
 		}
 		sni = clientHello.ServerName
-
 	} else {
 		slog.Debug("its http!")
 
 		sni, clientReader2, err = readRequestURLHttp(clientReader1)
 		if err != nil {
-			slog.Error("reading hostname from http", "Details", err)
+			slog.Error("reading hostname from http", "details", err)
 			return
 		}
-
 	}
 
-	slog.Debug("Got new request =>", "From", sni)
+	if sni == "" {
+		slog.Error("could not determine hostname (empty SNI/Host), closing connection")
+		return
+	}
 
-	backendConn, err := net.DialTimeout("tcp", net.JoinHostPort(sni, destPort), 5*time.Second)
+	slog.Debug("Got new request", "host", sni, "port", destPort)
+
+	backendAddr := net.JoinHostPort(sni, destPort)
+
+	if isLocalIP(sni) {
+		slog.Error("Loop blocked: request host points to local container", "host", sni)
+		return
+	}
+
+	if isProxyItself(sni, destPort) {
+		slog.Error("Blocking request to prevent proxy loop",
+			"host", sni,
+			"port", destPort,
+		)
+		return
+	}
+
+	backendConn, err := net.DialTimeout("tcp", backendAddr, 5*time.Second)
 	if err != nil {
-		slog.Error("sending req", "Details", err)
+		slog.Error("failed to connect to backend", "addr", backendAddr, "details", err)
 		return
 	}
 	defer backendConn.Close()
@@ -185,15 +215,26 @@ func handleConnection(clientConn net.Conn, incomingPort string) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// Backend -> Client
 	go func() {
-		io.Copy(clientConn, backendConn)
-		clientConn.(*net.TCPConn).CloseWrite()
-		wg.Done()
+		defer wg.Done()
+		_, _ = io.Copy(clientConn, backendConn)
+		if c, ok := clientConn.(*net.TCPConn); ok {
+			_ = c.CloseWrite()
+		} else {
+			_ = clientConn.Close()
+		}
 	}()
+
+	// Client -> Backend (using buffered reader that still has peeked bytes)
 	go func() {
-		io.Copy(backendConn, clientReader2)
-		backendConn.(*net.TCPConn).CloseWrite()
-		wg.Done()
+		defer wg.Done()
+		_, _ = io.Copy(backendConn, clientReader2)
+		if c, ok := backendConn.(*net.TCPConn); ok {
+			_ = c.CloseWrite()
+		} else {
+			_ = backendConn.Close()
+		}
 	}()
 
 	wg.Wait()
@@ -210,9 +251,10 @@ func isHTTPS(conn net.Conn) (bool, io.Reader, error) {
 
 	if n > 0 {
 		if buf[0] == 0x16 {
-			return true, originalConn, nil // It's HTTPS
+			// TLS handshake record
+			return true, originalConn, nil
 		}
-		return false, originalConn, nil // It's HTTP
+		return false, originalConn, nil
 	}
 
 	return false, originalConn, fmt.Errorf("no data read from the connection")
@@ -222,7 +264,6 @@ func readRequestURLHttp(conn io.Reader) (string, io.Reader, error) {
 	peekedBytes := new(bytes.Buffer)
 	reader := bufio.NewReader(io.TeeReader(conn, peekedBytes))
 
-	// Parse the HTTP request from the reader
 	req, err := http.ReadRequest(reader)
 	originalConn := io.MultiReader(peekedBytes, conn)
 	if err != nil {
@@ -230,6 +271,7 @@ func readRequestURLHttp(conn io.Reader) (string, io.Reader, error) {
 	}
 	return getHost(req), originalConn, nil
 }
+
 func getHost(r *http.Request) string {
 	host := r.Host
 	if i := strings.Index(host, ":"); i != -1 {
@@ -250,10 +292,17 @@ func peekClientHello(reader io.Reader) (*tls.ClientHelloInfo, io.Reader, error) 
 func readClientHello(reader io.Reader) (*tls.ClientHelloInfo, error) {
 	var hello *tls.ClientHelloInfo
 
-	err := tls.Server(ReadOnlyConn{reader: reader}, &tls.Config{
+	// Use the fixed ReadOnlyConn (pointer receiver) and set a handshake timeout
+	conn := &ReadOnlyConn{reader: reader}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	err := tls.Server(conn, &tls.Config{
 		GetConfigForClient: func(argHello *tls.ClientHelloInfo) (*tls.Config, error) {
-			hello = new(tls.ClientHelloInfo)
-			*hello = *argHello
+			h := new(tls.ClientHelloInfo)
+			*h = *argHello
+			hello = h
+			// We return nil config, nil error – handshake will later fail,
+			// but by then we've already captured ClientHello.
 			return nil, nil
 		},
 	}).Handshake()
@@ -263,4 +312,86 @@ func readClientHello(reader io.Reader) (*tls.ClientHelloInfo, error) {
 	}
 
 	return hello, nil
+}
+
+func getSelfIPs() []net.IP {
+	var result []net.IP
+
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				ip := ipnet.IP
+				if ip.IsLoopback() {
+					continue
+				}
+				result = append(result, ip)
+			}
+		}
+	}
+
+	return result
+}
+
+func isProxyItself(targetHost, targetPort string) bool {
+	ips, err := net.LookupIP(targetHost)
+	if err != nil {
+		return false
+	}
+
+	myIPs := getSelfIPs()
+
+	for _, targetIP := range ips {
+		for _, myIP := range myIPs {
+			if targetIP.Equal(myIP) {
+				slog.Warn("Loop detected: backend resolves to this proxy",
+					"resolved_ip", targetIP.String(),
+					"my_ip", myIP.String(),
+					"port", targetPort,
+				)
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func isLocalIP(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+
+	if ip.IsLoopback() {
+		return true
+	}
+
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				if ip.Equal(ipnet.IP) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func calculateBackendPort(incoming string) string {
+	p, err := strconv.Atoi(incoming)
+	if err != nil {
+		return incoming
+	}
+
+	if p >= 9000 && p <= 9999 {
+		return strconv.Itoa(p - 9000)
+	}
+
+	return incoming
 }
