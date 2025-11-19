@@ -27,6 +27,23 @@ var (
 	help     = flag.Bool("help", false, "Display help message")
 )
 
+var serverPublicIP string
+var dnsCache sync.Map
+
+var ipv4Services = []string{
+	"https://api.ipify.org",
+	"https://ipv4.icanhazip.com",
+	"https://ifconfig.me/ip",
+	"https://checkip.amazonaws.com",
+}
+
+var ipv6Services = []string{
+	"https://api6.ipify.org",
+	"https://ipv6.icanhazip.com",
+	"https://ifconfig.me/ip",
+	"https://ident.me",
+}
+
 func main() {
 	flag.Parse()
 
@@ -47,6 +64,8 @@ func main() {
 	default:
 		log.Fatalf("Invalid log level: %s", *LogLevel)
 	}
+
+	serverPublicIP = detectPublicIP()
 
 	ports := slices.DeleteFunc(strings.Split(*Port, ","), func(e string) bool {
 		return e == ""
@@ -202,6 +221,12 @@ func handleConnection(clientConn net.Conn, incomingPort string) {
 			"host", sni,
 			"port", destPort,
 		)
+		return
+	}
+
+	if resolvesToSelf(sni) {
+		slog.Error("Blocked: Host resolves to this server's public IP",
+			"host", sni, "public_ip", serverPublicIP)
 		return
 	}
 
@@ -394,4 +419,94 @@ func calculateBackendPort(incoming string) string {
 	}
 
 	return incoming
+}
+
+func isValidIPv4(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && parsed.To4() != nil
+}
+
+func isValidIPv6(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && parsed.To4() == nil
+}
+
+func detectPublicIP() string {
+	client := http.Client{Timeout: 4 * time.Second}
+
+	for _, service := range ipv4Services {
+		slog.Info("Trying IPv4 public IP service", "url", service)
+
+		resp, err := client.Get(service)
+		if err != nil {
+			slog.Warn("IPv4 service failed", "url", service, "err", err)
+			continue
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		ip := strings.TrimSpace(string(body))
+
+		if isValidIPv4(ip) {
+			slog.Info("Detected public IPv4", "ip", ip, "service", service)
+			return ip
+		}
+	}
+
+	slog.Warn("No IPv4 detected – falling back to IPv6")
+
+	for _, service := range ipv6Services {
+		slog.Info("Trying IPv6 public IP service", "url", service)
+
+		resp, err := client.Get(service)
+		if err != nil {
+			slog.Warn("IPv6 service failed", "url", service, "err", err)
+			continue
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		ip := strings.TrimSpace(string(body))
+
+		if isValidIPv6(ip) {
+			slog.Info("Detected public IPv6", "ip", ip, "service", service)
+			return ip
+		}
+	}
+
+	slog.Error("Failed to detect public IP via all providers")
+	return ""
+}
+
+func resolvesToSelf(host string) bool {
+	if host == serverPublicIP {
+		return true
+	}
+
+	if cached, ok := dnsCache.Load(host); ok {
+		ips := cached.([]net.IP)
+		for _, ip := range ips {
+			if ip.String() == serverPublicIP {
+				return true
+			}
+		}
+		return false
+	}
+
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return false
+	}
+
+	dnsCache.Store(host, ips)
+
+	for _, ip := range ips {
+		if ip.String() == serverPublicIP {
+			return true
+		}
+	}
+
+	return false
 }
